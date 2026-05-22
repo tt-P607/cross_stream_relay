@@ -1,0 +1,76 @@
+{
+  "name": "cross_stream_relay",
+  "version": "1.0.0",
+  "description": "跨聊天流互通插件：被动总览（摘要/短期记忆）+ 主动交接（relay 转告）",
+  "author": "MoFox Team",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "tool",
+      "component_name": "get_stream_summary",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "get_stream_raw_context",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "get_daily_memory",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "find_target_stream",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
+      "component_name": "update_stream_summary",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
+      "component_name": "relay_to_stream",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "auto_summary_handler",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "relay_message_decorator",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "command",
+      "component_name": "短期记忆",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "command",
+      "component_name": "relay",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [],
+  "dependencies_required": true
+}
