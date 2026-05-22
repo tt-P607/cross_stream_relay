@@ -57,6 +57,7 @@ class DailyMemoryRecord:
     summary: str
     message_count: int
     updated_at: str
+    last_summarized_ts: float = 0.0  # 上次摘要已覆盖到的最后一条消息的时间戳，用于增量更新
 
 
 @dataclass(slots=True)
@@ -159,6 +160,7 @@ def _load_record(data: dict[str, Any] | None) -> DailyMemoryRecord | None:
         summary=summary.strip(),
         message_count=int(data.get("message_count", 0) or 0),
         updated_at=str(data.get("updated_at", "") or ""),
+        last_summarized_ts=float(data.get("last_summarized_ts", 0.0) or 0.0),
     )
 
 
@@ -194,13 +196,27 @@ def _date_bounds(memory_date: str) -> tuple[float, float]:
     return start.timestamp(), end.timestamp()
 
 
-async def _fetch_day_messages(stream_id: str, memory_date: str) -> list[dict[str, Any]]:
-    """拉取某 stream 当日全部消息（按时间升序）。"""
+async def _fetch_day_messages(
+    stream_id: str,
+    memory_date: str,
+    since_ts: float = 0.0,
+) -> list[dict[str, Any]]:
+    """拉取某 stream 当日消息（按时间升序）。
+
+    Args:
+        stream_id: 聊天流 ID。
+        memory_date: 日期字符串 YYYY-MM-DD。
+        since_ts: 仅拉取这个时间戳之后（不含）的消息。0 表示当日全量。
+    """
 
     start_ts, end_ts = _date_bounds(memory_date)
+    # 增量起点：取 max(当日 0 点, since_ts + 1 微秒) 避免重复拉取已总结过的消息
+    effective_start = max(start_ts, since_ts + 1e-6) if since_ts > 0 else start_ts
+    if effective_start >= end_ts:
+        return []
     messages = await message_api.get_messages_by_time_in_chat(
         stream_id=stream_id,
-        start_time=start_ts,
+        start_time=effective_start,
         end_time=end_ts,
         limit=0,
         limit_mode="earliest",
@@ -208,6 +224,18 @@ async def _fetch_day_messages(stream_id: str, memory_date: str) -> list[dict[str
         filter_command=True,
     )
     return messages
+
+
+def _extract_message_timestamp(raw_message: dict[str, Any]) -> float:
+    """从消息字典中提取 unix 时间戳（用于水位线维护）。"""
+
+    raw_time = raw_message.get("time") or raw_message.get("timestamp") or 0.0
+    if isinstance(raw_time, datetime):
+        return raw_time.timestamp()
+    try:
+        return float(raw_time)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _build_persona_prompt() -> str:
@@ -253,16 +281,46 @@ async def _generate_full_day_summary(
     plugin: Any,
     state: DailyState,
     memory_date: str,
+    *,
+    force_full: bool = False,
 ) -> DailyMemoryRecord | None:
-    """对指定日期生成一次主观全量总结，覆盖旧记录。"""
+    """对指定日期生成短期记忆。
+
+    模式：
+      - 增量更新（默认）：读取已有记录的 last_summarized_ts 作为水位线，
+        只拉取水位线之后的新消息，让 LLM 在「上次摘要」基础上把新内容融合进去。
+      - 全量重做（force_full=True）：忽略水位线，重新读取当天全部消息从头总结。
+
+    Args:
+        plugin: 插件实例
+        state: 当前 stream 状态
+        memory_date: 目标日期
+        force_full: 是否强制全量重做（用于人工触发或跨天兜底）
+    """
 
     config = _get_config(plugin)
-    raw_messages = await _fetch_day_messages(state.stream_id, memory_date)
+
+    # ── 读取已有记录（用于增量基线 / 水位线）──
+    existing_record: DailyMemoryRecord | None = None
+    if not force_full:
+        existing_record = await get_memory(plugin, state.stream_id, memory_date)
+
+    since_ts = 0.0
+    if existing_record is not None and existing_record.last_summarized_ts > 0:
+        since_ts = existing_record.last_summarized_ts
+
+    raw_messages = await _fetch_day_messages(state.stream_id, memory_date, since_ts=since_ts)
     if not raw_messages:
-        logger.debug(
-            f"[daily_memory] stream={state.stream_id} date={memory_date} 当日无消息，跳过总结"
-        )
-        return None
+        if existing_record is None:
+            logger.debug(
+                f"[daily_memory] stream={state.stream_id} date={memory_date} 当日无消息，跳过总结"
+            )
+        else:
+            logger.debug(
+                f"[daily_memory] stream={state.stream_id} date={memory_date} "
+                f"自上次水位线 {since_ts} 以来无新消息，跳过更新"
+            )
+        return existing_record
 
     formatted = await message_api.build_readable_messages_to_str(
         messages=raw_messages,
@@ -272,7 +330,13 @@ async def _generate_full_day_summary(
         truncate=False,
     )
     if not formatted.strip():
-        return None
+        return existing_record
+
+    # 计算新水位线（取本次新增消息的最大时间戳）
+    new_watermark = max(
+        (_extract_message_timestamp(m) for m in raw_messages),
+        default=since_ts,
+    )
 
     # ── 取 bot 自身身份（用于第一人称视角）──
     bot_name = ""
@@ -305,54 +369,96 @@ async def _generate_full_day_summary(
 
     char_limit = max(200, int(config.daily_memory.max_summary_chars))
 
-    system_prompt = (
-        f"{bot_self_intro}是这个群聊的参与者之一。"
-        "现在你需要为「自己」整理一份当天发生在这个群里的主观短期记忆，"
-        "就像一个人晚上躺下来回忆白天发生过什么那样去写。\n"
-        "\n"
-        "硬性要求：\n"
-        "1. 必须用第一人称（『我』），写出你自己的视角和感受、判断、未做完的事，"
-        "不要切换成第三人称、不要写成新闻播报或会议纪要。\n"
-        "2. 提到任何人时，都必须给出他的【完整昵称】，并紧跟一个括号写出他的"
-        "【平台账号 ID / QQ 号】，例如：阿喵（123456789）。"
-        "提到自己时使用『我』，无须再写自己的 ID。\n"
-        "3. 写作必须有时间脉络：按发生先后顺序展开，使用粗略但可识别的时段描述，"
-        "比如『今天上午刚醒来的时候』『中午前后』『下午三四点』『傍晚』『深夜十二点之后』。"
-        "不需要也不要精确到分钟或秒，但不能完全打乱时序。\n"
-        "4. 必须涵盖：当天主要话题与转折、关键人物的发言/态度/情绪、"
-        "我自己说过的话/承诺/暂时没回的人、群里达成的事实或决议、"
-        "悬而未决的问题或下次需要继续的事项。\n"
-        "5. 可以表达主观判断与感受（『我觉得』『我担心』『我没太听懂』等），"
-        "但不可以编造没有出现的内容，不可以隐藏关键冲突。\n"
-        "6. 如果当天某些讨论可能对其他群也有补全价值（例如人物关系、专有名词、"
-        "事件背景），请显式写明，便于将来跨群查阅。\n"
-        f"7. 输出字数【上限】是 {char_limit} 个字符（含标点），这是上限不是配额。"
-        "如果当天信息不多，能讲清楚事情就直接收尾，不要为了凑字数而注水、复述或反复展开。"
-        "只有当一天信息确实多到塞不下时，才需要按重要性取舍：优先保留人物、决议、未完成事项、冲突；省略次要寒暄。\n"
-        "\n"
-        "输出形式：直接输出回忆正文，可以分段；不要标题，不要『以下是总结』之类的前言，"
-        "不要 JSON 或 Markdown 标题语法，不要逐条复述聊天记录。"
-    )
+    is_incremental = existing_record is not None and not force_full
+
+    if is_incremental:
+        # 增量模式：把上次摘要 + 这一段新消息塞给 LLM，让它合并出新摘要
+        system_prompt = (
+            f"{bot_self_intro}是这个群聊的参与者之一。"
+            "你之前已经为今天写过一份短期记忆，"
+            "现在群里又出现了一段新消息，你需要把这段新消息融合到原有的回忆里，"
+            "输出更新后的【完整一天】的短期记忆。\n"
+            "\n"
+            "硬性要求：\n"
+            "1. 必须用第一人称（『我』），保持原有回忆的时序结构与人格语气，"
+            "新消息按时间顺序自然衔接到原有内容里，不要打乱原本的结构。\n"
+            "2. 提到任何人时，都必须给出他的【完整昵称】，并紧跟一个括号写出他的"
+            "【平台账号 ID / QQ 号】，例如：阿喵（123456789）。提到自己时使用『我』。\n"
+            "3. 必须保留旧摘要里的核心信息（已确认事实、未完成事项、关键冲突），"
+            "除非新消息显式纠正或推翻了它们，此时你必须修正而不是保留旧错误。\n"
+            "4. 新消息中的关键内容（话题转折、新承诺、新决议、新冲突、新待办）必须被纳入。\n"
+            "5. 可以表达主观判断与感受，但不可以编造没有出现的内容。\n"
+            "6. 时间脉络保持粗粒度（『上午』『中午前后』『下午三四点』『傍晚』『深夜』），"
+            "不需要精确到分钟。\n"
+            f"7. 输出字数【上限】是 {char_limit} 个字符（含标点），这是上限不是配额。"
+            "如果信息不多就直接收尾，不要为了凑字数注水。"
+            "如果合并后超出字数，请按重要性取舍：优先保留人物、决议、未完成事项、冲突；"
+            "省略次要寒暄。\n"
+            "\n"
+            "输出形式：直接输出回忆正文，可以分段；不要标题，不要『以下是总结』之类的前言，"
+            "不要 JSON 或 Markdown 标题语法，不要逐条复述聊天记录。"
+            "不要在文中说『新增了什么』或『增量部分』，要让最终结果看起来就是一份完整的、自然书写的当日回忆。"
+        )
+    else:
+        # 全量模式：从零开始
+        system_prompt = (
+            f"{bot_self_intro}是这个群聊的参与者之一。"
+            "现在你需要为「自己」整理一份当天发生在这个群里的主观短期记忆，"
+            "就像一个人晚上躺下来回忆白天发生过什么那样去写。\n"
+            "\n"
+            "硬性要求：\n"
+            "1. 必须用第一人称（『我』），写出你自己的视角和感受、判断、未做完的事，"
+            "不要切换成第三人称、不要写成新闻播报或会议纪要。\n"
+            "2. 提到任何人时，都必须给出他的【完整昵称】，并紧跟一个括号写出他的"
+            "【平台账号 ID / QQ 号】，例如：阿喵（123456789）。"
+            "提到自己时使用『我』，无须再写自己的 ID。\n"
+            "3. 写作必须有时间脉络：按发生先后顺序展开，使用粗略但可识别的时段描述，"
+            "比如『今天上午刚醒来的时候』『中午前后』『下午三四点』『傍晚』『深夜十二点之后』。"
+            "不需要也不要精确到分钟或秒，但不能完全打乱时序。\n"
+            "4. 必须涵盖：当天主要话题与转折、关键人物的发言/态度/情绪、"
+            "我自己说过的话/承诺/暂时没回的人、群里达成的事实或决议、"
+            "悬而未决的问题或下次需要继续的事项。\n"
+            "5. 可以表达主观判断与感受（『我觉得』『我担心』『我没太听懂』等），"
+            "但不可以编造没有出现的内容，不可以隐藏关键冲突。\n"
+            "6. 如果当天某些讨论可能对其他群也有补全价值（例如人物关系、专有名词、"
+            "事件背景），请显式写明，便于将来跨群查阅。\n"
+            f"7. 输出字数【上限】是 {char_limit} 个字符（含标点），这是上限不是配额。"
+            "如果当天信息不多，能讲清楚事情就直接收尾，不要为了凑字数而注水、复述或反复展开。"
+            "只有当一天信息确实多到塞不下时，才需要按重要性取舍：优先保留人物、决议、未完成事项、冲突；省略次要寒暄。\n"
+            "\n"
+            "输出形式：直接输出回忆正文，可以分段；不要标题，不要『以下是总结』之类的前言，"
+            "不要 JSON 或 Markdown 标题语法，不要逐条复述聊天记录。"
+        )
 
     if persona_prompt:
         system_prompt = persona_prompt + "\n\n---\n\n" + system_prompt
 
     request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
-    request.add_payload(
-        LLMPayload(
-            ROLE.USER,
-            Text(
-                f"【群聊】{state.group_name or '未知'}（群号 {state.group_id or '未知'}）\n"
-                f"【日期】{memory_date}\n"
-                f"【消息总数】{len(raw_messages)}\n\n"
-                "下面是当天群里发生的全部聊天记录，按时间顺序：\n\n"
-                "【当日完整聊天记录】\n"
-                f"{formatted}\n\n"
-                "请你以第一人称、按时序，写出今天在这个群里你自己的主观短期记忆。"
-            ),
+    if is_incremental and existing_record is not None:
+        user_text = (
+            f"【群聊】{state.group_name or '未知'}（群号 {state.group_id or '未知'}）\n"
+            f"【日期】{memory_date}\n"
+            f"【已总结消息数】{existing_record.message_count}\n"
+            f"【本次新增消息数】{len(raw_messages)}\n\n"
+            "【上一次写出的当日短期记忆（原文）】\n"
+            f"{existing_record.summary}\n\n"
+            "【本次新增的群聊消息（按时间顺序，仅这一段是新内容）】\n"
+            f"{formatted}\n\n"
+            "请把上面这段新消息自然融合到原有回忆里，输出更新后的【完整一天】的短期记忆。"
         )
-    )
+    else:
+        user_text = (
+            f"【群聊】{state.group_name or '未知'}（群号 {state.group_id or '未知'}）\n"
+            f"【日期】{memory_date}\n"
+            f"【消息总数】{len(raw_messages)}\n\n"
+            "下面是当天群里发生的全部聊天记录，按时间顺序：\n\n"
+            "【当日完整聊天记录】\n"
+            f"{formatted}\n\n"
+            "请你以第一人称、按时序，写出今天在这个群里你自己的主观短期记忆。"
+        )
+
+    request.add_payload(LLMPayload(ROLE.USER, Text(user_text)))
 
     response = await request.send(stream=False)
     await response
@@ -361,9 +467,15 @@ async def _generate_full_day_summary(
         logger.warning(
             f"[daily_memory] stream={state.stream_id} date={memory_date} LLM 返回空，跳过"
         )
-        return None
+        return existing_record
 
     summary_text = _trim_text(summary_text, config.daily_memory.max_summary_chars)
+
+    # 累积消息计数：增量模式下要叠加在旧计数之上
+    cumulative_count = len(raw_messages)
+    if is_incremental and existing_record is not None:
+        cumulative_count += existing_record.message_count
+
     record = DailyMemoryRecord(
         stream_id=state.stream_id,
         group_id=state.group_id,
@@ -372,17 +484,19 @@ async def _generate_full_day_summary(
         chat_type=state.chat_type,
         memory_date=memory_date,
         summary=summary_text,
-        message_count=len(raw_messages),
+        message_count=cumulative_count,
         updated_at=datetime.now().isoformat(timespec="seconds"),
+        last_summarized_ts=new_watermark,
     )
     await storage_api.save_json(
         plugin.plugin_name,
         _memory_key(state.stream_id, memory_date),
         asdict(record),
     )
+    mode_label = "增量更新" if is_incremental else "全量总结"
     logger.info(
-        f"[daily_memory] stream={state.stream_id} date={memory_date} 总结完成，"
-        f"覆盖 {len(raw_messages)} 条消息，{len(summary_text)} 字"
+        f"[daily_memory] stream={state.stream_id} date={memory_date} {mode_label}完成，"
+        f"本次新增 {len(raw_messages)} 条，累计 {cumulative_count} 条，{len(summary_text)} 字"
     )
     return record
 
@@ -664,8 +778,9 @@ async def force_generate_today(
     plugin: Any,
     stream_id: str,
 ) -> DailyMemoryRecord | None:
-    """手动触发：立即对指定 stream 重新生成今天的短期记忆并覆盖。
+    """手动触发：立即对指定 stream 全量重做今天的短期记忆并覆盖。
 
+    与日常增量更新不同，此方法会忽略水位线，从当日 0 点重新读取所有消息。
     返回新生成的记录；若当日无消息或生成失败则返回 None。
     """
 
@@ -689,7 +804,7 @@ async def force_generate_today(
         if state.chat_type and state.chat_type != "group":
             return None
 
-        record = await _generate_full_day_summary(plugin, state, today)
+        record = await _generate_full_day_summary(plugin, state, today, force_full=True)
         if record is not None:
             state.last_summary_at = time.time()
             state.round_count = 0

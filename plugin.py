@@ -32,7 +32,6 @@ from .tool import (
     FindTargetStreamTool,
     GetDailyMemoryTool,
     GetStreamRawContextTool,
-    GetStreamSummaryTool,
 )
 
 logger = get_logger("cross_stream_relay")
@@ -97,7 +96,6 @@ class CrossStreamRelayPlugin(BasePlugin):
 
         return [
             # Tools
-            GetStreamSummaryTool,
             GetStreamRawContextTool,
             GetDailyMemoryTool,
             FindTargetStreamTool,

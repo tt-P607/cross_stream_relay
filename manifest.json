@@ -10,12 +10,6 @@
   "include": [
     {
       "component_type": "tool",
-      "component_name": "get_stream_summary",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
       "component_name": "get_stream_raw_context",
       "dependencies": [],
       "enabled": true

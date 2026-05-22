@@ -5,7 +5,6 @@
   - ACTOR_REMINDER_BUCKET / ACTOR_REMINDER_NAME 保持 ``actor`` / ``跨聊天流上下文摘要``，
     避免影响已注入到 actor bucket 的现有 chatter prompt 行为。
   - LLM 请求名称前缀 ``cross_stream_relay_auto_summary_*``。
-  - 提示词中提到的工具名同步切换到 ``get_stream_summary`` 等新命名。
 """
 
 from __future__ import annotations
@@ -612,8 +611,7 @@ def build_actor_reminder(
     lines.extend([
         "",
         "可用工具：",
-        "- tool-get_stream_summary: 获取一个或多个聊天流的当前摘要",
-        "- tool-get_stream_raw_context: 获取指定聊天流的原始聊天记录",
+        "- tool-get_stream_raw_context: 查询【其他聊天流】的原始聊天记录（不能用于本流，本流上下文已直接可见）",
         "- tool-get_daily_memory: 跨群查询某群最近几天（默认含今天）的短期记忆，用以补全摘要细节",
         "- tool-find_target_stream: 把名字/索引/QQ 号反查成 stream_id 等元组，供 relay_to_stream 使用",
         "- action-relay_to_stream: 把一段转告便条直接推送到目标流，并在目标流冷态时主动唤醒",

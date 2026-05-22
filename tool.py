@@ -1,12 +1,13 @@
 """cross_stream_relay 插件 Tool 组件。
 
-包含 4 个 Tool：
+包含 3 个 Tool：
 
-1. GetStreamSummaryTool（接自原 context_bridge.get_context_bridge_summary）
-2. GetStreamRawContextTool（接自原 context_bridge.get_context_bridge_raw_context）
-3. GetDailyMemoryTool（接自原 context_bridge.get_context_bridge_daily_memory）
-4. FindTargetStreamTool（新增）：把名字/索引/QQ 号/群号反查成完整目标流元组，
+1. GetStreamRawContextTool：查询【其他聊天流】的原始聊天记录（不能用于本流）
+2. GetDailyMemoryTool（接自原 context_bridge.get_context_bridge_daily_memory）
+3. FindTargetStreamTool：把名字/索引/QQ 号/群号反查成完整目标流元组，
    供 RelayToStreamAction 使用。
+
+已废弃：GetStreamSummaryTool（功能由 SystemReminder 注入的跨流摘要 + find_target_stream 完整覆盖）
 """
 
 from __future__ import annotations
@@ -29,100 +30,19 @@ from .service import StreamSummaryRecord, _build_stream_title, list_summary_reco
 logger = get_logger("cross_stream_relay.tool")
 
 
-class GetStreamSummaryTool(BaseTool):
-    """获取指定聊天流的摘要内容。"""
-
-    tool_name = "get_stream_summary"
-    tool_description = (
-        "获取一个或多个聊天流的摘要内容。"
-        "你可以通过聊天流名称或索引号来查询摘要。"
-        "摘要包含该聊天流的核心话题、背景上下文、已确认事实、用户偏好等关键信息。"
-        "支持同时查询多个聊天流，用逗号分隔标识符即可。"
-    )
-
-    chatter_allow: list[str] = []
-
-    async def execute(
-        self,
-        stream_identifiers: Annotated[
-            str,
-            "聊天流标识符，可以是单个或多个（用逗号分隔）。支持聊天流名称（如群名、私聊对方名称）或索引号（如 '1', '2' 或 '1,3,5'）",
-        ],
-    ) -> tuple[bool, str]:
-        """获取指定聊天流的摘要。"""
-
-        try:
-            records = await list_summary_records(self.plugin)
-            if not records:
-                return False, "当前没有任何聊天流摘要记录"
-
-            identifiers = [s.strip() for s in stream_identifiers.split(",") if s.strip()]
-            if not identifiers:
-                return False, "请提供有效的聊天流标识符"
-
-            results: list[str] = []
-            not_found: list[str] = []
-
-            for identifier in identifiers:
-                record = self._find_record(identifier, records)
-                if record:
-                    results.append(self._format_summary(record))
-                else:
-                    not_found.append(identifier)
-
-            if not results and not_found:
-                return False, f"未找到匹配的聊天流: {', '.join(not_found)}"
-
-            output = "\n\n".join(results)
-            if not_found:
-                output += f"\n\n注意：以下标识符未找到匹配: {', '.join(not_found)}"
-
-            return True, output
-
-        except Exception as error:
-            return False, f"获取摘要失败: {error}"
-
-    def _find_record(self, identifier: str, records: list[StreamSummaryRecord]) -> StreamSummaryRecord | None:
-        """查找单个聊天流记录。"""
-        if identifier.isdigit():
-            index = int(identifier) - 1
-            if 0 <= index < len(records):
-                return records[index]
-            return None
-
-        matched_records = [
-            r for r in records
-            if identifier.lower() in _build_stream_title(r).lower()
-        ]
-
-        if len(matched_records) == 1:
-            return matched_records[0]
-
-        return None
-
-    def _format_summary(self, record: StreamSummaryRecord) -> str:
-        """格式化摘要输出。"""
-        lines = [
-            f"聊天流: {_build_stream_title(record)}",
-            f"平台: {record.platform or 'unknown'}",
-            f"类型: {record.chat_type or 'unknown'}",
-            f"更新时间: {record.updated_at or 'unknown'}",
-            "",
-            "摘要内容:",
-            record.summary,
-        ]
-        return "\n".join(lines)
-
-
 class GetStreamRawContextTool(BaseTool):
-    """获取指定聊天流的完整原始上下文信息。"""
+    """查询【其他聊天流】的原始聊天记录（不能用于查询本聊天流）。"""
 
     tool_name = "get_stream_raw_context"
     tool_description = (
-        "获取指定聊天流的完整原始聊天记录。"
-        "这个工具返回的是从数据库中提取的真实聊天消息，而不是摘要。"
-        "你可以指定需要获取的消息数量，默认获取最近 20 条。"
-        "适用于需要查看详细对话内容的场景。"
+        "【跨流查询专用】查询「另一个聊天流」（不是当前聊天流）的真实原始聊天记录。\n"
+        "用途：当你想知道另一个群 / 另一个私聊里最近发生了什么时使用，"
+        "返回从数据库中读取的完整消息文本，不是摘要。\n"
+        "重要限制：\n"
+        "  1. 只能用于查询【其他聊天流】，绝不能用来查询【当前对话所在的聊天流】"
+        "（当前流的最近消息已经在你的上下文里，不需要也不应该用本工具重复获取）。\n"
+        "  2. 如果你想知道当前流之前发生过什么，请直接看上下文/历史消息，而不是调用本工具。\n"
+        "默认返回最近 20 条，可通过 message_count 调整。"
     )
 
     chatter_allow: list[str] = []
@@ -131,7 +51,7 @@ class GetStreamRawContextTool(BaseTool):
         self,
         stream_identifier: Annotated[
             str,
-            "聊天流标识符，可以是聊天流名称（如群名、私聊对方名称）或索引号（如 '1', '2'）",
+            "目标聊天流（必须是【其他聊天流】，不能是当前流）的标识符：聊天流名称（如群名、私聊对方名称）或索引号（如 '1', '2'）",
         ],
         message_count: Annotated[
             int,
