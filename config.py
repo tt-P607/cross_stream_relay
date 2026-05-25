@@ -27,7 +27,7 @@ class CrossStreamRelayConfig(BaseConfig):
             order=0,
         )
         inject_summary_reminder: bool = Field(
-            default=False,
+            default=True,
             description=(
                 "是否启用跨流摘要 SystemReminder 注入。"
                 "注意：如果目标流使用 kokoro_flow_chatter 等带自定义 context_manager 的 chatter，"
