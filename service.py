@@ -16,6 +16,7 @@ from typing import Any
 
 from src.app.plugin_system.api import llm_api, prompt_api, storage_api
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
+from src.core.prompt import SystemReminderConsumeType, SystemReminderInsertType
 from src.core.models.message import Message
 
 
@@ -661,6 +662,8 @@ async def sync_actor_reminder(
             ACTOR_REMINDER_BUCKET,
             ACTOR_REMINDER_NAME,
             reminder_text,
+            insert_type=SystemReminderInsertType.DYNAMIC,
+            consume=SystemReminderConsumeType.FOREVER,
         )
     except Exception as error:
         # 某些 chatter（如 KFC）使用自定义 context_manager，不支持动态 reminder 注入

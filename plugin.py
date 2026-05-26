@@ -74,19 +74,6 @@ class CrossStreamRelayPlugin(BasePlugin):
             guide = self.config.relay.usage_guide_prompt
             if guide and guide.strip():
                 base_desc = (
-                    "跨聊天流转告能力。允许你主动向另一个聊天流（群聊或私聊）发送信息，并唤醒目标流的对话逻辑。"
-                    "该能力常用于跨流带话、私聊确认群聊细节、或在不同窗口间自然切换对话状态。"
-                    "调用前请先用 find_target_stream 工具确认目标流的 stream_id 和 target_id。"
-                    "relay_content 是你在目标流的开场白，请以自然的口吻发起对话，避免机械化复述。\n\n"
-                )
-                RelayToStreamAction.action_description = base_desc + guide.strip()
-
-        # 把 usage_guide_prompt 注入到 RelayToStreamAction.action_description
-        # 必须在 get_components() 里更新，确保框架注册组件时读到的是完整描述
-        if isinstance(self.config, CrossStreamRelayConfig):
-            guide = self.config.relay.usage_guide_prompt
-            if guide and guide.strip():
-                base_desc = (
                     "跨聊天流意识迁移工具。允许你主动将当前的对话意图、背景和目标传递到另一个聊天流（群聊或私聊），"
                     "并唤醒目标流的对话逻辑。该工具的核心目的是实现「跨流无缝衔接」。"
                     "重要：如果你之前调用了 find_target_stream 工具，你必须立即使用其返回的参数调用此 Action，"
