@@ -1,7 +1,7 @@
 {
   "name": "cross_stream_relay",
   "display_name": "跨聊天流互通",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "跨聊天流互通插件：被动总览（摘要/短期记忆）+ 主动交接（relay 转告）",
   "author": "MoFox Team",
   "license": "AGPL-3.0",
