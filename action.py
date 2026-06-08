@@ -41,6 +41,7 @@ class UpdateStreamSummaryAction(BaseAction):
     )
 
     chatter_allow: list[str] = []
+    associated_types: list[str] = ["text"]
 
     async def execute(
         self,
@@ -128,6 +129,7 @@ class RelayToStreamAction(BaseAction):
     )
 
     chatter_allow: list[str] = []
+    associated_types: list[str] = ["text"]
 
     async def execute(
         self,
