@@ -2,7 +2,8 @@
 
 包含 3 个 Tool：
 
-1. GetStreamRawContextTool：查询【其他聊天流】的原始聊天记录（不能用于本流）
+1. GetStreamRawContextTool：查询任意聊天流的原始聊天记录，
+   支持时间段 + 关键词 + 发送者三条件任意组合查询。
 2. GetDailyMemoryTool（接自原 context_bridge.get_context_bridge_daily_memory）
 3. FindTargetStreamTool：把名字/索引/QQ 号/群号反查成完整目标流元组，
    供 RelayToStreamAction 使用。
@@ -31,18 +32,22 @@ logger = get_logger("cross_stream_relay.tool")
 
 
 class GetStreamRawContextTool(BaseTool):
-    """查询【其他聊天流】的原始聊天记录（不能用于查询本聊天流）。"""
+    """查询任意聊天流的原始聊天记录，支持时间段+关键词+发送者组合查询。"""
 
     tool_name = "get_stream_raw_context"
     tool_description = (
-        "【跨流查询专用】查询「另一个聊天流」（不是当前聊天流）的真实原始聊天记录。\n"
-        "用途：当你想知道另一个群 / 另一个私聊里最近发生了什么时使用，"
-        "返回从数据库中读取的完整消息文本，不是摘要。\n"
-        "重要限制：\n"
-        "  1. 只能用于查询【其他聊天流】，绝不能用来查询【当前对话所在的聊天流】"
-        "（当前流的最近消息已经在你的上下文里，不需要也不应该用本工具重复获取）。\n"
-        "  2. 如果你想知道当前流之前发生过什么，请直接看上下文/历史消息，而不是调用本工具。\n"
-        "默认返回最近 20 条，可通过 message_count 调整。"
+        "查询任意聊天流的真实原始聊天记录（从数据库读取，不是摘要）。\n"
+        "支持时间段、关键词、发送者三条件任意组合筛选。\n"
+        "\n"
+        "stream_identifier 用群号/QQ号/流名称指定目标流。\n"
+        "时间格式 'YYYY-MM-DD HH:MM'。\n"
+        "\n"
+        "典型组合：\n"
+        "- 无筛选：返回最近 message_count 条\n"
+        "- keyword：筛选含关键词的消息\n"
+        "- sender：只看某个人的发言\n"
+        "- start_time + end_time：查指定时段\n"
+        "- 三条件全传：查某时段内某人说的含关键词的话"
     )
 
     chatter_allow: list[str] = []
@@ -51,99 +56,260 @@ class GetStreamRawContextTool(BaseTool):
         self,
         stream_identifier: Annotated[
             str,
-            "目标聊天流（必须是【其他聊天流】，不能是当前流）的标识符：聊天流名称（如群名、私聊对方名称）或索引号（如 '1', '2'）",
+            "目标聊天流标识符：群号、QQ号或流名称（模糊匹配）",
         ],
         message_count: Annotated[
             int,
-            "需要获取的消息数量，默认 20 条。可以根据需要调整，比如 30、50 或更多",
+            "最终返回消息上限，默认 20 条，可按需调大",
         ] = 20,
+        start_time: Annotated[
+            str,
+            "可选筛选：时间段起点，格式 'YYYY-MM-DD HH:MM'，留空表示不限",
+        ] = "",
+        end_time: Annotated[
+            str,
+            "可选筛选：时间段终点，格式同上，留空表示到现在",
+        ] = "",
+        keyword: Annotated[
+            str,
+            "可选筛选：关键词（不区分大小写），留空表示不过滤",
+        ] = "",
+        sender: Annotated[
+            str,
+            "可选筛选：发送者，匹配用户名或QQ号（模糊匹配），留空表示不过滤",
+        ] = "",
     ) -> tuple[bool, str]:
-        """获取指定聊天流的原始聊天记录。"""
+        """获取指定聊天流的原始聊天记录，支持多条件组合查询。"""
 
         try:
             if message_count < 1:
                 return False, "消息数量必须大于 0"
-            if message_count > 200:
-                return False, "单次最多获取 200 条消息，请分批查询"
+            if message_count > 100:
+                return False, "单次最多获取 100 条消息"
 
-            records = await list_summary_records(self.plugin)
-            if not records:
-                return False, "当前没有任何聊天流记录"
+            # 解析目标流
+            target_record = await self._resolve_stream(stream_identifier)
+            if isinstance(target_record, str):
+                return False, target_record
 
-            target_record: StreamSummaryRecord | None = None
+            # 解析时间条件
+            start_ts = self._parse_time(start_time.strip()) if start_time.strip() else None
+            end_ts = self._parse_time(end_time.strip()) if end_time.strip() else None
+            if start_ts is not None and end_ts is not None and start_ts >= end_ts:
+                return False, "起始时间必须早于结束时间"
 
-            if stream_identifier.isdigit():
-                index = int(stream_identifier) - 1
-                if 0 <= index < len(records):
-                    target_record = records[index]
-                else:
-                    return False, f"索引号 {stream_identifier} 超出范围（共 {len(records)} 条记录）"
+            kw = keyword.strip().lower() if keyword.strip() else ""
+            sd = sender.strip().lower() if sender.strip() else ""
+
+            has_time_filter = start_ts is not None or end_ts is not None
+            has_content_filter = bool(kw) or bool(sd)
+
+            # 查询策略：
+            # - 有时间范围 → DB 时间范围查询，limit 放大以补偿内存侧过滤
+            # - 无时间范围 → get_recent_messages 取最近消息
+            fetch_limit = message_count * 5 if has_content_filter else message_count
+
+            if has_time_filter:
+                # 用 get_messages_by_time_in_chat 做时间范围查询
+                # end_time 为空时用当前时间
+                from time import time as _now
+                actual_end = end_ts if end_ts is not None else _now()
+                messages = await message_api.get_messages_by_time_in_chat(
+                    stream_id=target_record.stream_id,
+                    start_time=start_ts if start_ts is not None else 0.0,
+                    end_time=actual_end,
+                    limit=fetch_limit,
+                    limit_mode="latest",
+                    filter_bot=False,
+                )
             else:
-                matched_records = [
-                    r for r in records
-                    if stream_identifier.lower() in _build_stream_title(r).lower()
-                ]
+                # 无时间范围，取最近消息
+                messages = await message_api.get_recent_messages(
+                    stream_id=target_record.stream_id,
+                    hours=24 * 365,
+                    limit=fetch_limit,
+                    limit_mode="latest",
+                    filter_bot=False,
+                )
 
-                if not matched_records:
-                    return False, f"未找到匹配 '{stream_identifier}' 的聊天流"
+            # 内存侧过滤：关键词 + 发送者
+            if has_content_filter:
+                messages = self._filter_messages(messages, kw, sd)
 
-                if len(matched_records) > 1:
-                    result_lines = [f"找到 {len(matched_records)} 个匹配的聊天流："]
-                    for idx, record in enumerate(matched_records[:5], start=1):
-                        result_lines.append(
-                            f"{idx}. {_build_stream_title(record)} "
-                            f"[{record.platform}:{record.chat_type}]"
-                        )
-                    if len(matched_records) > 5:
-                        result_lines.append(f"... 还有 {len(matched_records) - 5} 条")
-                    result_lines.append("\n请使用更具体的名称或索引号查询")
-                    return False, "\n".join(result_lines)
+            # 截断到最终上限
+            if len(messages) > message_count:
+                messages = messages[-message_count:]
 
-                target_record = matched_records[0]
-
-            if target_record is None:
-                return False, "未找到目标聊天流"
-
-            messages = await message_api.get_recent_messages(
-                stream_id=target_record.stream_id,
-                hours=24 * 365,
-                limit=message_count,
-                limit_mode="latest",
-                filter_bot=False,
+            return True, await self._format_result(
+                target_record,
+                messages,
+                start_time=start_time.strip(),
+                end_time=end_time.strip(),
+                keyword=keyword.strip(),
+                sender=sender.strip(),
+                requested_limit=message_count,
             )
 
-            result_lines = [
-                f"聊天流: {_build_stream_title(target_record)}",
-                f"平台: {target_record.platform or 'unknown'}",
-                f"类型: {target_record.chat_type or 'unknown'}",
-                f"Stream ID: {target_record.stream_id}",
-                "",
-                f"最近 {len(messages)} 条原始聊天记录:",
-                "",
-            ]
-
-            if messages:
-                formatted_text = await message_api.build_readable_messages_to_str(
-                    messages=messages,
-                    replace_bot_name=False,
-                    merge_messages=False,
-                    timestamp_mode="absolute",
-                    truncate=False,
-                )
-                result_lines.append(formatted_text)
-            else:
-                result_lines.append("该聊天流暂无历史消息记录")
-
-            result_lines.extend([
-                "",
-                "当前摘要:",
-                target_record.summary,
-            ])
-
-            return True, "\n".join(result_lines)
-
+        except ValueError as error:
+            return False, str(error)
         except Exception as error:
+            logger.error(f"get_stream_raw_context 查询失败: {error}")
             return False, f"获取原始上下文失败: {error}"
+
+    async def _resolve_stream(
+        self,
+        identifier: str,
+    ) -> StreamSummaryRecord | str:
+        """解析聊天流标识符，返回记录或错误信息。
+
+        纯数字 → 按群号/QQ号匹配 target_id
+        字符串 → 模糊匹配流名称
+        """
+
+        ident = identifier.strip()
+        if not ident:
+            return "请提供有效的聊天流标识符"
+
+        records = await list_summary_records(self.plugin)
+        if not records:
+            return "当前没有任何聊天流记录"
+
+        # 纯数字 → 按 target_id（群号/QQ号）精确匹配
+        if ident.isdigit():
+            for r in records:
+                if r.target_id and str(r.target_id) == ident:
+                    return r
+            return f"未找到群号/QQ号为 '{ident}' 的聊天流"
+
+        # 字符串 → 模糊匹配流名称
+        matched = [
+            r for r in records
+            if ident.lower() in _build_stream_title(r).lower()
+        ]
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) == 0:
+            return f"未找到匹配 '{identifier}' 的聊天流"
+
+        # 多匹配：列出候选供精确化
+        lines = [f"找到 {len(matched)} 个匹配的聊天流，请用更精确的群号/QQ号或名称："]
+        for idx, r in enumerate(matched[:8], start=1):
+            lines.append(
+                f"{idx}. {_build_stream_title(r)} "
+                f"[{r.platform}:{r.chat_type}] (ID {r.target_id or '未知'})"
+            )
+        if len(matched) > 8:
+            lines.append(f"... 还有 {len(matched) - 8} 条未列出")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_time(time_str: str) -> float:
+        """解析 'YYYY-MM-DD HH:MM' 格式时间为时间戳。"""
+
+        from datetime import datetime as _dt
+        try:
+            return _dt.strptime(time_str, "%Y-%m-%d %H:%M").timestamp()
+        except ValueError:
+            raise ValueError(
+                f"时间格式不正确：'{time_str}'，应为 'YYYY-MM-DD HH:MM'"
+            )
+
+    @staticmethod
+    def _filter_messages(
+        messages: list[dict],
+        keyword: str,
+        sender: str,
+    ) -> list[dict]:
+        """在内存侧按关键词和发送者过滤消息。"""
+
+        result = []
+        for msg in messages:
+            # 发送者匹配：检查 sender_name 和 sender_id
+            if sender:
+                msg_sender = str(msg.get("sender_name") or "").lower()
+                msg_sender_id = str(msg.get("sender_id") or "").lower()
+                if sender not in msg_sender and sender not in msg_sender_id:
+                    continue
+            # 关键词匹配：检查消息文本
+            if keyword:
+                text = str(
+                    msg.get("processed_plain_text")
+                    or msg.get("content")
+                    or ""
+                ).lower()
+                if keyword not in text:
+                    continue
+            result.append(msg)
+        return result
+
+    @staticmethod
+    async def _format_result(
+        target: StreamSummaryRecord,
+        messages: list[dict],
+        *,
+        start_time: str,
+        end_time: str,
+        keyword: str,
+        sender: str,
+        requested_limit: int,
+    ) -> str:
+        """格式化查询结果输出。"""
+
+        from datetime import datetime as _dt
+
+        # 构建查询条件描述
+        conditions = []
+        if start_time:
+            conditions.append(f"起 {start_time}")
+        if end_time:
+            conditions.append(f"止 {end_time}")
+        if keyword:
+            conditions.append(f"关键词'{keyword}'")
+        if sender:
+            conditions.append(f"发送者含'{sender}'")
+        cond_desc = " | ".join(conditions) if conditions else "无筛选（取最近）"
+
+        lines = [
+            f"聊天流: {_build_stream_title(target)}",
+            f"平台/类型: {target.platform or 'unknown'} / {target.chat_type or 'unknown'}",
+            f"群号/QQ: {target.target_id or '未知'}",
+            f"查询条件: {cond_desc}",
+            f"返回: {len(messages)} 条 (上限 {requested_limit})",
+        ]
+
+        if messages:
+            # 计算实际时间范围
+            times = [float(m.get("time") or 0.0) for m in messages if m.get("time")]
+            if times:
+                earliest = _dt.fromtimestamp(min(times)).strftime("%Y-%m-%d %H:%M")
+                latest = _dt.fromtimestamp(max(times)).strftime("%Y-%m-%d %H:%M")
+                lines.append(f"时间跨度: {earliest} ~ {latest}")
+
+            # 参与者统计
+            from collections import Counter
+            senders = Counter(
+                str(m.get("sender_name") or m.get("sender_id") or "未知")
+                for m in messages
+            )
+            top_senders = ", ".join(
+                f"{name}({count}条)" for name, count in senders.most_common(5)
+            )
+            lines.append(f"参与者: {top_senders}")
+
+            lines.extend(["", "── 消息记录 ──", ""])
+
+            formatted_text = await message_api.build_readable_messages_to_str(
+                messages=messages,
+                replace_bot_name=False,
+                merge_messages=False,
+                timestamp_mode="absolute",
+                truncate=True,
+            )
+            lines.append(formatted_text)
+        else:
+            lines.extend(["", "该条件下没有匹配的消息"])
+
+        return "\n".join(lines)
 
 
 class GetDailyMemoryTool(BaseTool):
@@ -164,7 +330,7 @@ class GetDailyMemoryTool(BaseTool):
         self,
         stream_identifier: Annotated[
             str,
-            "目标群标识符：群名（模糊匹配）、索引号、或群号皆可。仅支持群聊。",
+            "目标群标识符：群号或群名（模糊匹配）。仅支持群聊。",
         ],
         days: Annotated[
             int,
@@ -231,7 +397,11 @@ class GetDailyMemoryTool(BaseTool):
         self,
         identifier: str,
     ) -> StreamSummaryRecord | str:
-        """根据标识符在已知聊天流中定位目标记录。返回字符串表示错误信息。"""
+        """根据标识符在已知聊天流中定位目标记录。返回字符串表示错误信息。
+
+        纯数字 → 按群号匹配 target_id
+        字符串 → 模糊匹配群名
+        """
 
         ident = identifier.strip()
         if not ident:
@@ -241,15 +411,14 @@ class GetDailyMemoryTool(BaseTool):
         if not records:
             return "目前没有任何聊天流记录可供解析"
 
-        if ident.isdigit() and len(ident) <= 4:
-            idx = int(ident) - 1
-            if 0 <= idx < len(records):
-                return records[idx]
+        # 纯数字 → 按 target_id（群号）精确匹配
+        if ident.isdigit():
+            for r in records:
+                if r.chat_type == "group" and r.target_id and str(r.target_id) == ident:
+                    return r
+            return f"未找到群号为 '{ident}' 的群聊"
 
-        for r in records:
-            if r.chat_type == "group" and r.target_id and str(r.target_id) == ident:
-                return r
-
+        # 字符串 → 模糊匹配群名
         matched = [
             r for r in records
             if r.chat_type == "group" and ident.lower() in _build_stream_title(r).lower()
@@ -257,7 +426,7 @@ class GetDailyMemoryTool(BaseTool):
         if len(matched) == 1:
             return matched[0]
         if len(matched) > 1:
-            preview_lines = [f"找到 {len(matched)} 个匹配的群，请用更精确的名称、群号或索引号："]
+            preview_lines = [f"找到 {len(matched)} 个匹配的群，请用更精确的群号或名称："]
             for idx, r in enumerate(matched[:6], start=1):
                 preview_lines.append(
                     f"{idx}. {_build_stream_title(r)} (群号 {r.target_id or '未知'})"

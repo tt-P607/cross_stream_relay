@@ -13,7 +13,7 @@ from src.app.plugin_system.base import BasePlugin, register_plugin
 from src.core.prompt import get_system_reminder_store
 from src.kernel.concurrency import get_task_manager
 
-from .action import RelayToStreamAction, UpdateStreamSummaryAction
+from .action import RelayReplyAction, RelayToStreamAction, UpdateStreamSummaryAction
 from .command import RelayCommand, ShortMemoryCommand
 from .config import CrossStreamRelayConfig
 from .daily_memory import run_archive_loop
@@ -89,6 +89,7 @@ class CrossStreamRelayPlugin(BasePlugin):
             # Actions
             UpdateStreamSummaryAction,
             RelayToStreamAction,
+            RelayReplyAction,
             # Event Handlers
             AutoSummaryHandler,
             RelayMessageDecorator,
