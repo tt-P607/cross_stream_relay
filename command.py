@@ -38,8 +38,8 @@ class ShortMemoryCommand(BaseCommand):
     仅主人（OWNER）可用。
     """
 
-    command_name: str = "短期记忆"
-    command_description: str = "立即重新生成本群当日短期记忆（仅主人可用）"
+    name: str = "短期记忆"
+    description: str = "立即重新生成本群当日短期记忆（仅主人可用）"
     permission_level: PermissionLevel = PermissionLevel.OWNER
 
     @classmethod
@@ -127,8 +127,8 @@ class RelayCommand(BaseCommand):
     仅主人（OWNER）可用。
     """
 
-    command_name: str = "relay"
-    command_description: str = "跨流转告调试与运维命令（仅主人可用）"
+    name: str = "relay"
+    description: str = "跨流转告调试与运维命令（仅主人可用）"
     permission_level: PermissionLevel = PermissionLevel.OWNER
 
     async def _reply(self, text: str) -> None:

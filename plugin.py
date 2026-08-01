@@ -54,7 +54,6 @@ class CrossStreamRelayPlugin(BasePlugin):
 
     plugin_name = "cross_stream_relay"
     plugin_description = "跨聊天流互通插件：摘要 / 短期记忆 / 跨流转告"
-    plugin_version = "1.0.0"
 
     configs: list[type] = [CrossStreamRelayConfig]
     dependent_components: list[str] = []
@@ -68,7 +67,7 @@ class CrossStreamRelayPlugin(BasePlugin):
             logger.info("cross_stream_relay 已在配置中禁用")
             return []
 
-        # 把 usage_guide_prompt 注入到 RelayToStreamAction.action_description
+        # 把 usage_guide_prompt 注入到 RelayToStreamAction.description
         # 必须在 get_components() 里更新，确保框架注册组件时读到的是完整描述
         if isinstance(self.config, CrossStreamRelayConfig):
             guide = self.config.relay.usage_guide_prompt
@@ -79,7 +78,7 @@ class CrossStreamRelayPlugin(BasePlugin):
                     "重要：如果你之前调用了 find_target_stream 工具，你必须立即使用其返回的参数调用此 Action，"
                     "严禁在获取目标 ID 后不执行迁移。这是实现跨流互通的最后一步，也是最关键的一步。\n\n"
                 )
-                RelayToStreamAction.action_description = base_desc + guide.strip()
+                RelayToStreamAction.description = base_desc + guide.strip()
 
         return [
             # Tools

@@ -34,8 +34,8 @@ logger = get_logger("cross_stream_relay.action")
 class UpdateStreamSummaryAction(BaseAction):
     """为当前聊天流写入最新摘要并同步 reminder。"""
 
-    action_name = "update_stream_summary"
-    action_description = (
+    name = "update_stream_summary"
+    description = (
         "为当前聊天流写入最新摘要，并同步到跨聊天流 system reminder。"
         "插件默认会自动根据消息批次更新摘要，因此这个 action 主要用于人工纠偏。"
         "只有当你判断当前摘要已经偏离真实情况、包含事实错误，或需要在全站范围立刻记录某个约定时才调用。"
@@ -124,8 +124,8 @@ def _format_context_messages(messages: list[dict]) -> str:
 class RelayToStreamAction(BaseAction):
     """跨聊天流转告：将信息主动传递到另一个聊天流，并唤醒目标流的对话逻辑。"""
 
-    action_name = "relay_to_stream"
-    action_description = (
+    name = "relay_to_stream"
+    description = (
         "跨聊天流意识迁移工具。允许你主动将当前的对话意图、背景和目标传递到另一个聊天流（群聊或私聊），"
         "并唤醒目标流的对话逻辑。该工具的核心目的是实现「跨流无缝衔接」。"
         "重要：如果你之前调用了 find_target_stream 工具，你必须立即使用其返回的参数调用此 Action，"
@@ -367,8 +367,8 @@ class RelayReplyAction(BaseAction):
     不需要也不应该由模型手动指定。
     """
 
-    action_name = "relay_reply"
-    action_description = (
+    name = "relay_reply"
+    description = (
         "跨流转告回执工具。当你在目标流处理完一条来自其他流的跨流转告后，"
         "用此工具把处理结果反馈给发起转告的那个流。\n"
         "\n"

@@ -24,6 +24,7 @@ from .config import CrossStreamRelayConfig
 
 ACTOR_REMINDER_BUCKET = "actor"
 ACTOR_REMINDER_NAME = "跨聊天流上下文摘要"
+_DAILY_MEMORY_REMINDER_NAME = "跨聊天流今日短期记忆"
 
 _stream_locks: dict[str, asyncio.Lock] = {}
 
@@ -547,10 +548,11 @@ def build_actor_reminder(
     visible_stream_limit: int,
     current_chat_type: str = "",
     current_stream_id: str = "",
-    today_memory_summary: str = "",
-    today_memory_date: str = "",
 ) -> str:
-    """构建注入到 actor bucket 的跨聊天流摘要 reminder。
+    """构建注入到全局 actor bucket 的跨聊天流摘要 reminder。
+
+    短期记忆（per-stream）不再嵌入此全局 reminder，
+    由 :func:`sync_actor_reminder` 单独写入流私有 bucket。
 
     Args:
         plugin: 插件实例
@@ -558,8 +560,6 @@ def build_actor_reminder(
         visible_stream_limit: 可见聊天流上限
         current_chat_type: 当前正在渲染 reminder 的聊天类型
         current_stream_id: 当前 stream_id（用于在标题处标注"当前流"）
-        today_memory_summary: 当前群当日短期记忆正文（仅群聊上下文注入）
-        today_memory_date: 当前群当日短期记忆对应日期
     """
 
     from .privacy_filter import should_show_in_reminder
@@ -601,15 +601,6 @@ def build_actor_reminder(
         # 收尾去除最后多余空行
         if lines and lines[-1] == "":
             lines.pop()
-
-    if today_memory_summary:
-        lines.extend([
-            "",
-            f"【本群今日短期记忆 · {today_memory_date}】",
-            today_memory_summary,
-            "（说明：上方摘要为持续跟进的精简版；这份『短期记忆』是 actor 模型对当日群聊的全量总结，"
-            "用于补全摘要可能遗漏的细节。每发若干轮或闲置一段时间后会全量刷新覆盖。）",
-        ])
 
     lines.extend([
         "",
@@ -659,8 +650,6 @@ async def sync_actor_reminder(
         visible_stream_limit=config.plugin.visible_stream_limit,
         current_chat_type=current_chat_type,
         current_stream_id=current_stream_id,
-        today_memory_summary=today_memory_summary,
-        today_memory_date=today_memory_date,
     )
     try:
         prompt_api.add_system_reminder(
@@ -678,4 +667,29 @@ async def sync_actor_reminder(
         logger.debug(
             f"[sync_actor_reminder] 注入 reminder 失败（可能是 chatter 使用自定义 context_manager）: {error}"
         )
+
+    # 短期记忆是 per-stream 的，写入流私有 bucket
+    if today_memory_summary and current_stream_id:
+        memory_text = (
+            f"【本群今日短期记忆 · {today_memory_date}】\n"
+            f"{today_memory_summary}\n"
+            "（说明：上方摘要为持续跟进的精简版；这份『短期记忆』是 actor 模型对当日群聊的全量总结，"
+            "用于补全摘要可能遗漏的细节。每发若干轮或闲置一段时间后会全量刷新覆盖。）"
+        )
+        try:
+            prompt_api.add_stream_reminder(
+                stream_id=current_stream_id,
+                bucket=ACTOR_REMINDER_BUCKET,
+                name=_DAILY_MEMORY_REMINDER_NAME,
+                content=memory_text,
+                insert_type=SystemReminderInsertType.DYNAMIC,
+                consume=SystemReminderConsumeType.FOREVER,
+            )
+        except Exception as error:
+            from src.app.plugin_system.api.log_api import get_logger
+            logger = get_logger("cross_stream_relay.service")
+            logger.debug(
+                f"[sync_actor_reminder] 注入流私有短期记忆 reminder 失败: {error}"
+            )
+
     return reminder_text

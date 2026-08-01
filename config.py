@@ -12,8 +12,8 @@ from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_se
 class CrossStreamRelayConfig(BaseConfig):
     """跨聊天流互通插件配置。"""
 
-    config_name = "config"
-    config_description = "跨聊天流互通插件：摘要 / 短期记忆 / 跨流转告"
+    name = "config"
+    description = "跨聊天流互通插件：摘要 / 短期记忆 / 跨流转告"
 
     @config_section("plugin", title="插件设置", tag="plugin")
     class PluginSection(SectionBase):

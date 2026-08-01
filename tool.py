@@ -34,8 +34,8 @@ logger = get_logger("cross_stream_relay.tool")
 class GetStreamRawContextTool(BaseTool):
     """查询任意聊天流的原始聊天记录，支持时间段+关键词+发送者组合查询。"""
 
-    tool_name = "get_stream_raw_context"
-    tool_description = (
+    name = "get_stream_raw_context"
+    description = (
         "查询任意聊天流的真实原始聊天记录（从数据库读取，不是摘要）。\n"
         "支持时间段、关键词、发送者三条件任意组合筛选。\n"
         "\n"
@@ -315,8 +315,8 @@ class GetStreamRawContextTool(BaseTool):
 class GetDailyMemoryTool(BaseTool):
     """跨群查询某群最近若干天的"短期记忆"（每日全量总结）。"""
 
-    tool_name = "get_daily_memory"
-    tool_description = (
+    name = "get_daily_memory"
+    description = (
         "查询某个群的「短期记忆」。短期记忆是 actor 模型对该群当天全部聊天的全量总结，"
         "比摘要更详细，用于在摘要信息不足时补全细节。"
         "支持跨群查询：你可以在 A 群中查询 B 群的短期记忆，用以理解你之前在 B 群的语境。\n"
@@ -479,8 +479,8 @@ class FindTargetStreamTool(BaseTool):
     LLM 拿到这个元组后，应当再调用 ``relay_to_stream`` Action 实施转告。
     """
 
-    tool_name = "find_target_stream"
-    tool_description = (
+    name = "find_target_stream"
+    description = (
         "跨流转告的前置查找工具。用于将用户名、群名、QQ号、群号或索引号反查为跨流转告所需的完整元组（stream_id, target_id 等）。"
         "当你决定要进行意识迁移但不知道目标流的确切 ID 时使用此工具。"
         "找到目标后，你必须立即调用 relay_to_stream Action 来完成实际的跨流转告。"

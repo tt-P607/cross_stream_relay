@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.app.plugin_system.api import prompt_api
 from src.app.plugin_system.api.event_api import EventDecision
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseEventHandler
@@ -38,8 +37,8 @@ class AutoSummaryHandler(BaseEventHandler):
     行为完全继承自原 context_bridge.event_handler.ContextBridgeAutoSummaryHandler。
     """
 
-    handler_name = "auto_summary_handler"
-    handler_description = "按消息批次自动刷新跨流摘要，并按轮次/闲置时间触发每日短期记忆"
+    name = "auto_summary_handler"
+    description = "按消息批次自动刷新跨流摘要，并按轮次/闲置时间触发每日短期记忆"
     weight = 0
     intercept_message = False
     init_subscribe = [EventType.ON_MESSAGE_RECEIVED, EventType.ON_MESSAGE_SENT]
@@ -129,8 +128,8 @@ class RelayMessageDecorator(BaseEventHandler):
     实现"删除"——并通过判定 unread 是否仍含转告消息来决定是否再次写入）。
     """
 
-    handler_name = "relay_message_decorator"
-    handler_description = "为跨流转告虚拟消息注入辅助 SystemReminder，避免被误读为用户消息"
+    name = "relay_message_decorator"
+    description = "为跨流转告虚拟消息注入辅助 SystemReminder，避免被误读为用户消息"
     weight = 0
     intercept_message = False
     init_subscribe = [EventType.ON_CHATTER_STEP]
