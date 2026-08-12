@@ -53,7 +53,6 @@ class CrossStreamRelayPlugin(BasePlugin):
     """
 
     plugin_name = "cross_stream_relay"
-    plugin_description = "跨聊天流互通插件：摘要 / 短期记忆 / 跨流转告"
 
     configs: list[type] = [CrossStreamRelayConfig]
     dependent_components: list[str] = []
