@@ -10,11 +10,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from src.app.plugin_system.api import llm_api, prompt_api, storage_api
+from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.types import LLMPayload, ROLE, Text
 from src.core.prompt import SystemReminderConsumeType, SystemReminderInsertType
 from src.core.models.message import Message
@@ -22,9 +25,21 @@ from src.core.models.message import Message
 
 from .config import CrossStreamRelayConfig
 
+logger = get_logger("cross_stream_relay.service")
+
 ACTOR_REMINDER_BUCKET = "actor"
 ACTOR_REMINDER_NAME = "跨聊天流上下文摘要"
 _DAILY_MEMORY_REMINDER_NAME = "跨聊天流今日短期记忆"
+
+# 同一个流连续失败到这个次数就暂停重试，等该流下一次摘要成功后恢复；
+# 失败计数持久化，重启不会把已经放弃的批次重新翻出来刷屏。
+_MAX_CONSECUTIVE_FAILURES = 3
+# 同一个批次重试的最小间隔（秒）。批次内容会随新消息变化，所以必须用
+# 「指纹 + 冷却时间」判定：冷却期内同一批不再重放，避免每次新消息都触发一次失败调用。
+_BATCH_RETRY_COOLDOWN_SECONDS = 300.0
+# 进程内记录「上一次失败的批次指纹 + 失败时间」。
+_FAILED_BATCH_SIGNATURES: dict[str, _FailedBatch] = {}
+_MONOTONIC = time.monotonic
 
 _stream_locks: dict[str, asyncio.Lock] = {}
 
@@ -56,6 +71,14 @@ class PendingMessageRecord:
     timestamp: float
 
 
+@dataclass(slots=True)
+class _FailedBatch:
+    """进程内记住「哪个批次失败了、什么时候失败的」。"""
+
+    signature: str
+    failed_at: float
+
+
 def _get_config(plugin: Any) -> CrossStreamRelayConfig:
     """获取插件配置，缺失时返回默认配置。"""
 
@@ -74,6 +97,67 @@ def _pending_key(stream_id: str) -> str:
     """生成待处理消息缓冲键。"""
 
     return f"pending_{stream_id}"
+
+
+def _failure_key(stream_id: str) -> str:
+    """生成连续失败计数存储键。"""
+
+    return f"summary_failures_{stream_id}"
+
+
+def _batch_signature(messages: list[PendingMessageRecord]) -> str | None:
+    """给一批消息生成可比对的指纹，用于识别「是不是同一批」。"""
+
+    if not messages:
+        return None
+    parts = [
+        f"{item.message_id}:{item.direction}:{item.sender_name}:{item.text}"
+        for item in messages
+    ]
+    return hashlib.sha1("\n".join(parts).encode("utf-8", "ignore")).hexdigest()
+
+
+async def _load_summary_failure_count(plugin: Any, stream_id: str) -> int:
+    """读取某个流连续失败的次数。"""
+
+    try:
+        payload = await storage_api.load_json(plugin.plugin_name, _failure_key(stream_id))
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    value = payload.get("failures", 0)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _save_summary_failure_count(plugin: Any, stream_id: str, count: int) -> None:
+    """写入某个流连续失败的次数。"""
+
+    try:
+        await storage_api.save_json(
+            plugin.plugin_name,
+            _failure_key(stream_id),
+            {"failures": int(count), "updated_at": datetime.now(UTC).isoformat(timespec="seconds")},
+        )
+    except Exception as error:  # 失败计数只是保护，不应影响主流程
+        logger.debug(f"跨流摘要：写入失败计数出错: {error}")
+
+
+async def _bump_summary_failure_count(plugin: Any, stream_id: str) -> int:
+    """失败次数 +1 并返回新值。"""
+
+    count = await _load_summary_failure_count(plugin, stream_id) + 1
+    await _save_summary_failure_count(plugin, stream_id, count)
+    return count
+
+
+async def _reset_summary_failure_count(plugin: Any, stream_id: str) -> None:
+    """摘要成功后清零失败次数。"""
+
+    await _save_summary_failure_count(plugin, stream_id, 0)
 
 
 def _get_stream_lock(stream_id: str) -> asyncio.Lock:
@@ -472,40 +556,92 @@ async def collect_message_for_auto_summary(
             await storage_api.load_json(plugin.plugin_name, _record_key(stream_id))
         )
         changed = False
+        batch_started = False
+        failure_count = 0
+        # 注意：指纹必须基于「即将发送的那一批」（前 batch_size 条），
+        # 而不是整个缓冲；否则新消息一来指纹就变，同一批会被无限重放。
+        signature = _batch_signature(pending_messages[:batch_size])
 
-        while len(pending_messages) >= batch_size:
-            current_batch = pending_messages[:batch_size]
-            previous_summary = previous_record.summary if previous_record is not None else ""
-            updated_summary = await _generate_updated_summary(
-                plugin,
-                stream_id,
-                previous_summary,
-                current_batch,
-            )
-            resolved_stream_id, stream_name, platform, chat_type, prev_target_id = _resolve_summary_meta(
-                previous_record,
-                current_batch,
-                stream_id,
-            )
-
-            final_target_id = prev_target_id or target_id
-
-            changed = (
-                await _upsert_summary_record(
-                    plugin,
-                    stream_id=resolved_stream_id,
-                    stream_name=stream_name,
-                    platform=platform,
-                    chat_type=chat_type,
-                    target_id=final_target_id,
-                    summary=updated_summary,
+        # 同一批消息失败后先冷却一段时间再重试；冷却期内不再重放同一批，
+        # 否则每条新消息都会触发一次注定失败的调用，把一次失败放大成成百上千条错误日志。
+        if signature is not None:
+            last_failure = _FAILED_BATCH_SIGNATURES.get(stream_id)
+            if last_failure is not None and last_failure.signature == signature:
+                waited = _MONOTONIC() - last_failure.failed_at
+                if waited < _BATCH_RETRY_COOLDOWN_SECONDS:
+                    logger.debug(
+                        f"跨流摘要：同一批消息处于失败冷却中（{int(waited)}s/"
+                        f"{int(_BATCH_RETRY_COOLDOWN_SECONDS)}s），跳过重放 "
+                        f"stream_id={stream_id[:8]}"
+                    )
+                    await _save_pending_messages(plugin, stream_id, pending_messages)
+                    return False
+            if await _load_summary_failure_count(plugin, stream_id) >= _MAX_CONSECUTIVE_FAILURES:
+                logger.warning(
+                    f"跨流摘要：{stream_id[:8]} 已连续 {_MAX_CONSECUTIVE_FAILURES} 次失败，"
+                    "暂停重试，等该流摘要成功后恢复"
                 )
-            ) or changed
-            previous_record = _deserialize_record(
-                await storage_api.load_json(plugin.plugin_name, _record_key(stream_id))
-            )
-            pending_messages = pending_messages[batch_size:]
+                await _save_pending_messages(plugin, stream_id, pending_messages)
+                return False
 
+        try:
+            while len(pending_messages) >= batch_size:
+                current_batch = pending_messages[:batch_size]
+                batch_started = True
+                previous_summary = previous_record.summary if previous_record is not None else ""
+                updated_summary = await _generate_updated_summary(
+                    plugin,
+                    stream_id,
+                    previous_summary,
+                    current_batch,
+                )
+                resolved_stream_id, stream_name, platform, chat_type, prev_target_id = _resolve_summary_meta(
+                    previous_record,
+                    current_batch,
+                    stream_id,
+                )
+
+                final_target_id = prev_target_id or target_id
+
+                changed = (
+                    await _upsert_summary_record(
+                        plugin,
+                        stream_id=resolved_stream_id,
+                        stream_name=stream_name,
+                        platform=platform,
+                        chat_type=chat_type,
+                        target_id=final_target_id,
+                        summary=updated_summary,
+                    )
+                ) or changed
+                await _reset_summary_failure_count(plugin, stream_id)
+                previous_record = _deserialize_record(
+                    await storage_api.load_json(plugin.plugin_name, _record_key(stream_id))
+                )
+                pending_messages = pending_messages[batch_size:]
+        except Exception as error:
+            # 失败也必须落盘：否则本次 pending 既没保存也没消费，
+            # 下一条消息进来会重复处理同一批消息。
+            failure_count = await _bump_summary_failure_count(plugin, stream_id)
+            await _save_pending_messages(plugin, stream_id, pending_messages)
+            if signature is not None:
+                # 记住失败批次与时间，冷却期内不再重放同一批。
+                _FAILED_BATCH_SIGNATURES[stream_id] = _FailedBatch(
+                    signature=signature,
+                    failed_at=_MONOTONIC(),
+                )
+            logger.warning(
+                f"自动摘要本批更新失败: stream_id={stream_id}, error={error} "
+                f"(已连续失败 {failure_count} 次，同一批消息进入 "
+                f"{int(_BATCH_RETRY_COOLDOWN_SECONDS)}s 冷却)"
+            )
+            return False
+
+        if signature is not None:
+            # 本次批次已消费完成，允许该流继续正常积累下一批。
+            _FAILED_BATCH_SIGNATURES.pop(stream_id, None)
+            if batch_started:
+                await _reset_summary_failure_count(plugin, stream_id)
         await _save_pending_messages(plugin, stream_id, pending_messages)
 
     if changed:
