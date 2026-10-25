@@ -78,6 +78,18 @@ def _trim_relay_content(content: str, max_chars: int) -> str:
     return content[: max_chars - 16].rstrip() + "...(已截断)"
 
 
+async def _start_stream_loop(stream_id: str) -> bool:
+    """启动流循环管理器并确认目标流循环已运行。"""
+    from src.core.transport.distribution.stream_loop_manager import (
+        get_stream_loop_manager,
+    )
+
+    loop_manager = get_stream_loop_manager()
+    if not loop_manager.is_running:
+        await loop_manager.start()
+    return await loop_manager.start_stream_loop(stream_id)
+
+
 def _format_context_messages(messages: list[dict]) -> str:
     """将消息列表格式化为带 sender_id 的可读字符串。
 
@@ -306,17 +318,21 @@ class RelayToStreamAction(BaseAction):
             **extra_kwargs,
         )
 
-        # 注入并启动
+        # 入队与启动分别处理，避免把未入队说成已入队。
         try:
             chat_stream.context.add_unread_message(virtual_message)
-            from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
-            await get_stream_loop_manager().start_stream_loop(chat_stream.stream_id)
         except Exception as error:
             logger.error(f"[relay] 注入虚拟消息失败: {error}")
-            return False, f"注入虚拟消息失败: {error}"
+            return False, f"转告入队失败：{error}"
+        try:
+            if not await _start_stream_loop(chat_stream.stream_id):
+                return False, "转告已入队，但目标流启动失败，尚未确认处理或响应；不要重复发送"
+        except Exception as error:
+            logger.error(f"[relay] 启动目标流失败: {error}")
+            return False, f"转告已入队但目标流启动失败，尚未确认处理或响应：{error}；不要重复发送"
 
         target_label = chat_stream.stream_name or chat_stream.stream_id[:8]
-        return True, f"已成功将你的意识迁移至「{target_label}」，目标流的你稍后会自然续接对话。"
+        return True, f"转告已入队并确认目标流运行：「{target_label}」。这不代表目标流已处理或回复。"
 
     async def _resolve_target_stream(
         self,
@@ -503,18 +519,22 @@ class RelayReplyAction(BaseAction):
             **extra_kwargs,
         )
 
-        # 注入并启动来源流
+        # 入队与启动分别处理，避免把未入队说成已入队。
         try:
             origin_chat_stream.context.add_unread_message(virtual_message)
-            from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
-            await get_stream_loop_manager().start_stream_loop(resolved_origin_id)
         except Exception as error:
             logger.error(f"[relay_reply] 注入回执虚拟消息失败: {error}")
-            return False, f"注入回执失败: {error}"
+            return False, f"回执入队失败: {error}"
+        try:
+            if not await _start_stream_loop(resolved_origin_id):
+                return False, "回执已入队，但来源流启动失败，尚未确认处理或响应；不要重复发送"
+        except Exception as error:
+            logger.error(f"[relay_reply] 启动来源流失败: {error}")
+            return False, f"回执已入队但来源流启动失败，尚未确认处理或响应：{error}；不要重复发送"
 
         return True, (
-            f"已将回执发送至「{origin_stream_name}」，"
-            f"那边的你会知道这边已经处理好了。"
+            f"回执已入队并确认来源流运行：「{origin_stream_name}」。"
+            "这不代表来源流已处理或回复。"
         )
 
     def _find_relay_origin(self) -> str:
